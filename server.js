@@ -103,7 +103,7 @@ app.get('/view/:trackingId', (req, res) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>View Estimate</title>
+      <title>Estimate Received</title>
       <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -144,28 +144,46 @@ app.get('/view/:trackingId', (req, res) => {
           font-size: 24px;
           margin-bottom: 12px;
         }
-        p {
+        .subtitle {
           color: #666;
           line-height: 1.6;
           margin-bottom: 24px;
         }
-        .tracking-id {
-          background: #f5f5f5;
-          padding: 12px 20px;
-          border-radius: 8px;
-          font-family: monospace;
-          font-size: 14px;
-          color: #333;
+        .info-box {
+          background: #f8f9fa;
+          border-radius: 12px;
+          padding: 20px;
           margin-bottom: 24px;
+          text-align: left;
+        }
+        .info-box h3 {
+          color: #333;
+          font-size: 14px;
+          font-weight: 600;
+          margin-bottom: 12px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .info-box p {
+          color: #666;
+          font-size: 14px;
+          line-height: 1.5;
+          margin: 0;
         }
         .badge {
           display: inline-block;
           background: #e8f5e9;
           color: #2e7d32;
-          padding: 8px 16px;
-          border-radius: 20px;
-          font-size: 14px;
+          padding: 10px 20px;
+          border-radius: 25px;
+          font-size: 15px;
           font-weight: 500;
+        }
+        .tracking-id {
+          margin-top: 20px;
+          font-size: 12px;
+          color: #999;
         }
         .footer {
           margin-top: 32px;
@@ -180,17 +198,27 @@ app.get('/view/:trackingId', (req, res) => {
       <div class="container">
         <div class="icon">
           <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/>
-            <polyline points="14 2 14 8 20 8" fill="none" stroke="white" stroke-width="2"/>
-            <line x1="16" y1="13" x2="8" y2="13" stroke="white" stroke-width="2"/>
-            <line x1="16" y1="17" x2="8" y2="17" stroke="white" stroke-width="2"/>
-            <line x1="10" y1="9" x2="8" y2="9" stroke="white" stroke-width="2"/>
+            <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" fill="white"/>
           </svg>
         </div>
-        <h1>Estimate Received</h1>
-        <p>Your contractor has been notified that you've viewed this estimate. They will follow up with you shortly.</p>
-        <div class="tracking-id">Reference: ${trackingId}</div>
+        <h1>Receipt Confirmed!</h1>
+        <p class="subtitle">Your contractor has been notified.</p>
+
+        <div class="info-box">
+          <h3>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#667eea" stroke-width="2">
+              <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+              <polyline points="22,6 12,13 2,6"/>
+            </svg>
+            Check Your Email
+          </h3>
+          <p>The full estimate PDF has been sent to your email. You can save, print, or review the complete details there.</p>
+        </div>
+
         <div class="badge">✓ View Confirmed</div>
+
+        <div class="tracking-id">Reference: ${trackingId}</div>
+
         <div class="footer">
           Powered by EstimatePro
         </div>
