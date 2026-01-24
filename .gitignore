@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Database
+*.db
+*.db-journal
+tracking-data.json
+
+# Environment
+.env
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
