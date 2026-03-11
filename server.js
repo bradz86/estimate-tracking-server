@@ -184,6 +184,22 @@ const authenticateAPI = (req, res, next) => {
 };
 app.use('/api', authenticateAPI);
 
+// Disable caching on all API responses (Intuit security requirement)
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
+// Disable TRACE and TRACK HTTP methods (Intuit security requirement)
+app.use((req, res, next) => {
+  if (req.method === 'TRACE' || req.method === 'TRACK') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  next();
+});
+
 // Helper to get client IP
 function getClientIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0] ||
@@ -564,8 +580,8 @@ app.post('/api/quickbooks/token-exchange', async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('QB token exchange failed:', data);
-      return res.status(response.status).json({ error: 'Token exchange failed', details: data });
+      console.error('QB token exchange failed: status', response.status);
+      return res.status(response.status).json({ error: 'Token exchange failed' });
     }
 
     res.json(data);
@@ -609,8 +625,8 @@ app.post('/api/quickbooks/token-refresh', async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('QB token refresh failed:', data);
-      return res.status(response.status).json({ error: 'Token refresh failed', details: data });
+      console.error('QB token refresh failed: status', response.status);
+      return res.status(response.status).json({ error: 'Token refresh failed' });
     }
 
     res.json(data);
