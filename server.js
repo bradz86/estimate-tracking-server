@@ -524,6 +524,103 @@ app.post('/api/contractor/register', async (req, res) => {
 });
 
 // ============================================
+// QUICKBOOKS OAUTH PROXY
+// ============================================
+
+const QB_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
+
+// Exchange authorization code for tokens
+app.post('/api/quickbooks/token-exchange', async (req, res) => {
+  const { code, redirect_uri } = req.body;
+
+  if (!code || !redirect_uri) {
+    return res.status(400).json({ error: 'code and redirect_uri are required' });
+  }
+
+  const clientId = process.env.QB_CLIENT_ID;
+  const clientSecret = process.env.QB_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ error: 'QuickBooks credentials not configured on server' });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: redirect_uri
+    });
+
+    const response = await fetch(QB_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+        'Accept': 'application/json'
+      },
+      body: params.toString()
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('QB token exchange failed:', data);
+      return res.status(response.status).json({ error: 'Token exchange failed', details: data });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('QB token exchange error:', err);
+    res.status(500).json({ error: 'Token exchange request failed' });
+  }
+});
+
+// Refresh access token
+app.post('/api/quickbooks/token-refresh', async (req, res) => {
+  const { refresh_token } = req.body;
+
+  if (!refresh_token) {
+    return res.status(400).json({ error: 'refresh_token is required' });
+  }
+
+  const clientId = process.env.QB_CLIENT_ID;
+  const clientSecret = process.env.QB_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ error: 'QuickBooks credentials not configured on server' });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refresh_token
+    });
+
+    const response = await fetch(QB_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+        'Accept': 'application/json'
+      },
+      body: params.toString()
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('QB token refresh failed:', data);
+      return res.status(response.status).json({ error: 'Token refresh failed', details: data });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('QB token refresh error:', err);
+    res.status(500).json({ error: 'Token refresh request failed' });
+  }
+});
+
+// ============================================
 // ESTIMATE REGISTRATION
 // ============================================
 
