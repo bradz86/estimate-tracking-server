@@ -543,7 +543,23 @@ app.post('/api/contractor/register', async (req, res) => {
 // QUICKBOOKS OAUTH PROXY
 // ============================================
 
-const QB_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
+// Intuit discovery document for dynamic endpoint resolution
+const QB_DISCOVERY_URL = 'https://developer.api.intuit.com/.well-known/openid_configuration';
+let qbTokenUrl = null;
+
+async function getQBTokenUrl() {
+  if (qbTokenUrl) return qbTokenUrl;
+  try {
+    const response = await fetch(QB_DISCOVERY_URL, { headers: { 'Accept': 'application/json' } });
+    const discovery = await response.json();
+    qbTokenUrl = discovery.token_endpoint;
+    console.log('✓ QuickBooks token endpoint resolved from discovery document');
+    return qbTokenUrl;
+  } catch (err) {
+    console.error('Failed to fetch QB discovery document, using fallback:', err.message);
+    return 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
+  }
+}
 
 // Exchange authorization code for tokens
 app.post('/api/quickbooks/token-exchange', async (req, res) => {
@@ -567,7 +583,8 @@ app.post('/api/quickbooks/token-exchange', async (req, res) => {
       redirect_uri: redirect_uri
     });
 
-    const response = await fetch(QB_TOKEN_URL, {
+    const tokenUrl = await getQBTokenUrl();
+    const response = await fetch(tokenUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -612,7 +629,8 @@ app.post('/api/quickbooks/token-refresh', async (req, res) => {
       refresh_token: refresh_token
     });
 
-    const response = await fetch(QB_TOKEN_URL, {
+    const tokenUrl = await getQBTokenUrl();
+    const response = await fetch(tokenUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
