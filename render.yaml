@@ -1,0 +1,73 @@
+services:
+  - type: web
+    name: estimate-tracking-server
+    runtime: node
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /health
+
+    # Storage must outlive a restart. On the free plan the filesystem is
+    # ephemeral: every deploy and every spin-down wipes tracking-data.json,
+    # taking device tokens, contractor registrations and view history with it.
+    # `starter` is also the lowest plan that does not cold-start, which matters
+    # because a customer opening an estimate link is the one hitting the server.
+    disk:
+      name: tracking-data
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /var/data/tracking-data.json
+
+      # Set these in the Render dashboard — never commit their values.
+      - key: API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+      # Apple Push Notifications
+      - key: APNS_KEY_ID
+        sync: false
+      - key: APNS_TEAM_ID
+        sync: false
+      - key: APNS_KEY_BASE64
+        sync: false
+      - key: APP_BUNDLE_ID
+        value: com.estimatepro.app
+
+      # Sign in with Apple revocation (App Store Guideline 5.1.1(v)).
+      # APPLE_KEY_* come from a Sign in with Apple key, which is a *different*
+      # key from the APNs one above. Without these, /api/apple/* return 501 and
+      # account deletion erases local and server data without revoking the grant.
+      - key: APPLE_CLIENT_ID
+        value: com.estimatepro.app
+      - key: APPLE_TEAM_ID
+        sync: false
+      - key: APPLE_KEY_ID
+        sync: false
+      - key: APPLE_KEY_BASE64
+        sync: false
+
+      # QuickBooks OAuth proxy
+      - key: QB_CLIENT_ID
+        sync: false
+      - key: QB_CLIENT_SECRET
+        sync: false
+
+      # Email notifications
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_SECURE
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false

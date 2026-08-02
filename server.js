@@ -17,8 +17,20 @@ function escapeHtml(str) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// JSON file-based storage
-const DB_FILE = path.join(__dirname, 'tracking-data.json');
+// JSON file-based storage.
+//
+// DB_PATH must point at a mounted persistent disk in production. The default
+// lives inside the deploy directory, which on Render's free tier is ephemeral —
+// every restart and redeploy wipes it, taking device tokens, contractor
+// registrations and view history with it.
+const DB_FILE = process.env.DB_PATH || path.join(__dirname, 'tracking-data.json');
+
+if (process.env.NODE_ENV === 'production' && !process.env.DB_PATH) {
+  console.warn(
+    '⚠ DB_PATH is not set. Storage is ephemeral and WILL be lost on restart.\n' +
+    '  Attach a persistent disk and set DB_PATH=/var/data/tracking-data.json'
+  );
+}
 
 // Initialize or load database
 function loadDB() {
@@ -35,7 +47,8 @@ function loadDB() {
     views: [],
     devices: [],
     notifications: [],
-    contractor: null
+    contractors: {},
+    nextViewId: 1
   };
 }
 
@@ -63,9 +76,32 @@ async function saveDB() {
 let db = loadDB();
 
 // Ensure db has all required fields
+if (!db.estimates) db.estimates = {};
+if (!db.views) db.views = [];
 if (!db.devices) db.devices = [];
 if (!db.notifications) db.notifications = [];
-if (!db.contractor) db.contractor = null;
+if (!db.contractors) db.contractors = {};
+
+// Migrate legacy single-tenant shape. Records from before multi-tenancy have no
+// owner, so they are parked under a reserved id that no client can present and
+// are therefore invisible to every contractor.
+const LEGACY_OWNER = '__legacy__';
+if (db.contractor) {
+  db.contractors[LEGACY_OWNER] = db.contractor;
+  delete db.contractor;
+}
+for (const estimate of Object.values(db.estimates)) {
+  if (!estimate.contractor_id) estimate.contractor_id = LEGACY_OWNER;
+}
+for (const device of db.devices) {
+  if (!device.contractorId) device.contractorId = LEGACY_OWNER;
+}
+for (const notification of db.notifications) {
+  if (!notification.contractorId) notification.contractorId = LEGACY_OWNER;
+}
+if (typeof db.nextViewId !== 'number') {
+  db.nextViewId = db.views.reduce((max, v) => Math.max(max, v.id || 0), 0) + 1;
+}
 
 // ============================================
 // APNs Setup (Apple Push Notifications)
@@ -184,6 +220,33 @@ const authenticateAPI = (req, res, next) => {
 };
 app.use('/api', authenticateAPI);
 
+// Contractor scoping.
+//
+// The API key is shared by every install (it ships inside the app bundle), so it
+// only proves "this is the app" — never "this is a particular user". Every /api
+// route that touches stored data must additionally scope by contractor id, which
+// each install generates locally and sends on every request.
+const CONTRACTOR_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
+
+const resolveContractor = (req, res, next) => {
+  const raw = req.headers['x-contractor-id'] || req.body?.contractorId;
+  if (!raw || !CONTRACTOR_ID_PATTERN.test(raw)) {
+    return res.status(400).json({ error: 'Missing or malformed contractor id' });
+  }
+  if (raw === LEGACY_OWNER) {
+    return res.status(400).json({ error: 'Reserved contractor id' });
+  }
+  req.contractorId = raw;
+  next();
+};
+
+// Applies to every /api route except the QuickBooks OAuth proxy, which brokers a
+// token exchange and stores nothing.
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/quickbooks/')) return next();
+  return resolveContractor(req, res, next);
+});
+
 // Disable caching on all API responses (Intuit security requirement)
 app.use('/api', (req, res, next) => {
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -213,7 +276,14 @@ function getClientIP(req) {
 // ============================================
 
 async function sendPushNotification(trackingId, estimate) {
-  if (!apnProvider || db.devices.length === 0) return;
+  if (!apnProvider) return;
+
+  // Only the contractor who registered this estimate may be told about it.
+  const ownerId = estimate.contractor_id;
+  if (!ownerId) return;
+
+  const ownerDevices = db.devices.filter(d => d.contractorId === ownerId);
+  if (ownerDevices.length === 0) return;
 
   const apn = require('@parse/node-apn');
   const notification = new apn.Notification();
@@ -222,7 +292,7 @@ async function sendPushNotification(trackingId, estimate) {
     title: 'Estimate Viewed!',
     body: `${estimate.customerName || 'A customer'} viewed "${estimate.title || 'your estimate'}"`
   };
-  notification.badge = db.notifications.filter(n => !n.isRead).length + 1;
+  notification.badge = db.notifications.filter(n => n.contractorId === ownerId && !n.isRead).length + 1;
   notification.sound = 'default';
   notification.topic = process.env.APP_BUNDLE_ID || 'com.estimatepro.app';
   notification.payload = {
@@ -231,7 +301,7 @@ async function sendPushNotification(trackingId, estimate) {
     customerName: estimate.customerName
   };
 
-  for (const device of db.devices) {
+  for (const device of ownerDevices) {
     try {
       const result = await apnProvider.send(notification, device.token);
       if (result.failed.length > 0) {
@@ -246,11 +316,12 @@ async function sendPushNotification(trackingId, estimate) {
 }
 
 async function sendEmailNotification(trackingId, estimate, viewInfo) {
-  if (!emailTransporter || !db.contractor?.email) return;
+  const owner = estimate.contractor_id ? db.contractors[estimate.contractor_id] : null;
+  if (!emailTransporter || !owner?.email) return;
 
   const mailOptions = {
     from: process.env.SMTP_FROM || 'EstimatePro <notifications@estimatepro.app>',
-    to: db.contractor.email,
+    to: owner.email,
     subject: `Estimate Viewed: ${estimate.title || trackingId}`,
     html: `
       <!DOCTYPE html>
@@ -310,8 +381,12 @@ async function sendEmailNotification(trackingId, estimate, viewInfo) {
 }
 
 async function storeInAppNotification(trackingId, estimate) {
+  const ownerId = estimate.contractor_id;
+  if (!ownerId) return null;
+
   const notification = {
-    id: `notif_${Date.now()}`,
+    id: `notif_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+    contractorId: ownerId,
     trackingId: trackingId,
     estimateTitle: estimate.title || 'Untitled Estimate',
     customerName: estimate.customerName || null,
@@ -322,10 +397,14 @@ async function storeInAppNotification(trackingId, estimate) {
 
   db.notifications.unshift(notification);
 
-  // Keep only last 100 notifications
-  if (db.notifications.length > 100) {
-    db.notifications = db.notifications.slice(0, 100);
-  }
+  // Keep the last 100 notifications per contractor, so a busy account cannot
+  // evict a quiet one's history.
+  const seen = new Map();
+  db.notifications = db.notifications.filter(n => {
+    const count = (seen.get(n.contractorId) || 0) + 1;
+    seen.set(n.contractorId, count);
+    return count <= 100;
+  });
 
   await saveDB();
   return notification;
@@ -344,9 +423,10 @@ async function recordView(trackingId, req) {
   const estimate = db.estimates[trackingId];
   const isFirstView = !db.views.some(v => v.tracking_id === trackingId);
 
-  // Record the view
+  // Record the view. Ids come from a monotonic counter — deriving them from
+  // array length collides once MAX_VIEWS starts trimming from the front.
   const view = {
-    id: db.views.length + 1,
+    id: db.nextViewId++,
     tracking_id: trackingId,
     viewed_at: new Date().toISOString(),
     ip_address: getClientIP(req),
@@ -504,12 +584,14 @@ app.post('/api/device/register', async (req, res) => {
     return res.status(400).json({ error: 'deviceToken required' });
   }
 
-  // Remove existing entry for this token
+  // Remove existing entry for this token. A token belongs to exactly one
+  // install, so re-registering it also reassigns ownership.
   db.devices = db.devices.filter(d => d.token !== deviceToken);
 
   // Add new entry
   db.devices.push({
     token: deviceToken,
+    contractorId: req.contractorId,
     platform: platform || 'ios',
     bundleId: bundleId,
     registeredAt: new Date().toISOString()
@@ -528,7 +610,7 @@ app.post('/api/contractor/register', async (req, res) => {
     return res.status(400).json({ error: 'Valid email address is required' });
   }
 
-  db.contractor = {
+  db.contractors[req.contractorId] = {
     email,
     name: name || null,
     companyName: companyName || null,
@@ -655,6 +737,173 @@ app.post('/api/quickbooks/token-refresh', async (req, res) => {
 });
 
 // ============================================
+// SIGN IN WITH APPLE — TOKEN REVOCATION
+// ============================================
+//
+// Guideline 5.1.1(v) requires that deleting an account also revokes the Sign in
+// with Apple grant. Revocation must be authenticated with a client secret: an
+// ES256 JWT signed with a Sign in with Apple private key. That key can never
+// ship inside the app, so the client cannot do this itself — it previously
+// called Apple's revoke endpoint directly with no client credentials at all,
+// which always failed silently.
+//
+// Configure with APPLE_KEY_ID, APPLE_KEY_BASE64 (base64 of the .p8),
+// APPLE_TEAM_ID and APPLE_CLIENT_ID. Unconfigured, these routes report 501 and
+// the app falls back to deleting local data only.
+
+const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || process.env.APP_BUNDLE_ID;
+const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || process.env.APNS_TEAM_ID;
+const APPLE_KEY_ID = process.env.APPLE_KEY_ID;
+
+function appleSigningKey() {
+  if (process.env.APPLE_KEY_BASE64) {
+    return Buffer.from(process.env.APPLE_KEY_BASE64, 'base64').toString('utf8');
+  }
+  const keyPath = path.join(__dirname, 'apple-signin-key.p8');
+  if (fs.existsSync(keyPath)) return fs.readFileSync(keyPath, 'utf8');
+  return null;
+}
+
+function appleRevocationConfigured() {
+  return Boolean(APPLE_CLIENT_ID && APPLE_TEAM_ID && APPLE_KEY_ID && appleSigningKey());
+}
+
+const base64url = (input) =>
+  Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+/// Builds the ES256 client secret Apple requires on /auth/token and /auth/revoke.
+function appleClientSecret() {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'ES256', kid: APPLE_KEY_ID };
+  const payload = {
+    iss: APPLE_TEAM_ID,
+    iat: now,
+    exp: now + 3600,
+    aud: 'https://appleid.apple.com',
+    sub: APPLE_CLIENT_ID
+  };
+
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+
+  // 'ieee-p1363' produces the raw r||s form JOSE expects. The default DER
+  // encoding is rejected by Apple.
+  const signature = crypto.sign(null, Buffer.from(signingInput), {
+    key: appleSigningKey(),
+    dsaEncoding: 'ieee-p1363'
+  });
+
+  return `${signingInput}.${signature.toString('base64url')}`;
+}
+
+async function applePost(endpoint, params) {
+  const response = await fetch(`https://appleid.apple.com/auth/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params).toString()
+  });
+  const text = await response.text();
+  return { ok: response.ok, status: response.status, text };
+}
+
+// Exchange the authorization code captured at sign-in for a refresh token, and
+// keep it so the account can be revoked later without a second sign-in prompt.
+app.post('/api/apple/link', async (req, res) => {
+  if (!appleRevocationConfigured()) {
+    return res.status(501).json({ error: 'Apple revocation not configured' });
+  }
+
+  const { authorizationCode } = req.body;
+  if (!authorizationCode) {
+    return res.status(400).json({ error: 'authorizationCode required' });
+  }
+
+  try {
+    const result = await applePost('token', {
+      client_id: APPLE_CLIENT_ID,
+      client_secret: appleClientSecret(),
+      code: authorizationCode,
+      grant_type: 'authorization_code'
+    });
+
+    if (!result.ok) {
+      console.error('Apple code exchange failed:', result.status, result.text);
+      return res.status(502).json({ error: 'Apple rejected the authorization code' });
+    }
+
+    const { refresh_token: refreshToken } = JSON.parse(result.text);
+    if (!refreshToken) {
+      return res.status(502).json({ error: 'Apple returned no refresh token' });
+    }
+
+    const contractor = db.contractors[req.contractorId] || {};
+    contractor.appleRefreshToken = refreshToken;
+    db.contractors[req.contractorId] = contractor;
+    await saveDB();
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Apple link error:', err.message);
+    res.status(500).json({ error: 'Could not link Apple account' });
+  }
+});
+
+// Revoke the grant and forget everything stored for this contractor.
+app.post('/api/apple/revoke', async (req, res) => {
+  if (!appleRevocationConfigured()) {
+    return res.status(501).json({ error: 'Apple revocation not configured' });
+  }
+
+  const contractor = db.contractors[req.contractorId];
+  const refreshToken = contractor?.appleRefreshToken;
+
+  if (refreshToken) {
+    try {
+      const result = await applePost('revoke', {
+        client_id: APPLE_CLIENT_ID,
+        client_secret: appleClientSecret(),
+        token: refreshToken,
+        token_type_hint: 'refresh_token'
+      });
+
+      if (!result.ok) {
+        console.error('Apple revoke failed:', result.status, result.text);
+        return res.status(502).json({ error: 'Apple rejected the revocation' });
+      }
+    } catch (err) {
+      console.error('Apple revoke error:', err.message);
+      return res.status(500).json({ error: 'Could not reach Apple' });
+    }
+  }
+
+  // Deletion is unconditional once revocation has succeeded (or there was
+  // nothing to revoke), so an account never survives a delete request.
+  purgeContractor(req.contractorId);
+  await saveDB();
+
+  res.json({ success: true, revoked: Boolean(refreshToken) });
+});
+
+/// Removes every record belonging to a contractor.
+function purgeContractor(contractorId) {
+  delete db.contractors[contractorId];
+  db.devices = db.devices.filter(d => d.contractorId !== contractorId);
+  db.notifications = db.notifications.filter(n => n.contractorId !== contractorId);
+
+  const owned = Object.values(db.estimates).filter(e => e.contractor_id === contractorId);
+  const ownedIds = new Set(owned.map(e => e.tracking_id));
+  for (const id of ownedIds) delete db.estimates[id];
+  db.views = db.views.filter(v => !ownedIds.has(v.tracking_id));
+}
+
+// Account deletion for contractors who never linked Apple — still must erase
+// everything the server holds about them.
+app.post('/api/account/delete', async (req, res) => {
+  purgeContractor(req.contractorId);
+  await saveDB();
+  res.json({ success: true });
+});
+
+// ============================================
 // ESTIMATE REGISTRATION
 // ============================================
 
@@ -663,13 +912,21 @@ app.post('/api/register/:trackingId', async (req, res) => {
   const { trackingId } = req.params;
   const { title, customerName, customerEmail, total } = req.body;
 
+  // Tracking ids are unguessable, but a second contractor must still not be able
+  // to overwrite metadata for an id someone else already claimed.
+  const existing = db.estimates[trackingId];
+  if (existing?.contractor_id && existing.contractor_id !== req.contractorId) {
+    return res.status(409).json({ error: 'Tracking id already registered' });
+  }
+
   db.estimates[trackingId] = {
     tracking_id: trackingId,
+    contractor_id: req.contractorId,
     title: title || null,
     customerName: customerName || null,
     customerEmail: customerEmail || null,
     total: total || null,
-    created_at: new Date().toISOString()
+    created_at: existing?.created_at || new Date().toISOString()
   };
 
   await saveDB();
@@ -680,15 +937,21 @@ app.post('/api/register/:trackingId', async (req, res) => {
 // NOTIFICATIONS API
 // ============================================
 
-// Get notifications for contractor
-app.get('/api/notifications', (req, res) => {
-  res.json(db.notifications || []);
-});
+// Get notifications for the calling contractor.
+// Accepts POST as well as GET: the client sends its device token in a body so it
+// stays out of access logs, and a GET with a body is not reliably deliverable.
+const listNotifications = (req, res) => {
+  res.json(db.notifications.filter(n => n.contractorId === req.contractorId));
+};
+app.get('/api/notifications', listNotifications);
+app.post('/api/notifications', listNotifications);
 
 // Mark notification as read
 app.post('/api/notifications/:notificationId/read', async (req, res) => {
   const { notificationId } = req.params;
-  const notification = db.notifications.find(n => n.id === notificationId);
+  const notification = db.notifications.find(
+    n => n.id === notificationId && n.contractorId === req.contractorId
+  );
 
   if (notification) {
     notification.isRead = true;
@@ -701,7 +964,9 @@ app.post('/api/notifications/:notificationId/read', async (req, res) => {
 
 // Mark all as read
 app.post('/api/notifications/read-all', async (req, res) => {
-  db.notifications.forEach(n => n.isRead = true);
+  db.notifications
+    .filter(n => n.contractorId === req.contractorId)
+    .forEach(n => n.isRead = true);
   await saveDB();
   res.json({ success: true });
 });
@@ -712,6 +977,12 @@ app.post('/api/notifications/read-all', async (req, res) => {
 
 app.get('/api/views/:trackingId', (req, res) => {
   const { trackingId } = req.params;
+
+  const estimate = db.estimates[trackingId];
+  if (!estimate || estimate.contractor_id !== req.contractorId) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
   const trackingViews = db.views.filter(v => v.tracking_id === trackingId);
   const sortedViews = [...trackingViews].sort((a, b) => new Date(b.viewed_at) - new Date(a.viewed_at));
 
@@ -721,14 +992,17 @@ app.get('/api/views/:trackingId', (req, res) => {
     lastViewedAt: sortedViews[0]?.viewed_at || null,
     views: sortedViews.slice(0, 50).map(v => ({
       timestamp: v.viewed_at,
-      ip_hash: crypto.createHash('sha256').update(v.ip_address || '').digest('hex').substring(0, 8),
+      ipHash: crypto.createHash('sha256').update(v.ip_address || '').digest('hex').substring(0, 8),
       userAgent: v.user_agent,
     }))
   });
 });
 
 app.get('/api/estimates', (req, res) => {
-  const estimates = Object.values(db.estimates).map(estimate => {
+  const owned = Object.values(db.estimates)
+    .filter(e => e.contractor_id === req.contractorId);
+
+  const estimates = owned.map(estimate => {
     const views = db.views.filter(v => v.tracking_id === estimate.tracking_id);
     const sortedViews = [...views].sort((a, b) => new Date(b.viewed_at) - new Date(a.viewed_at));
     return {
