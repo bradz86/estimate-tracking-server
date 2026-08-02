@@ -461,7 +461,13 @@ app.get('/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     push: apnProvider ? 'configured' : 'not configured',
-    email: emailTransporter ? 'configured' : 'not configured'
+    email: emailTransporter ? 'configured' : 'not configured',
+    appleRevocation: appleRevocationConfigured() ? 'configured' : 'not configured',
+    // Booleans only — never the path. Lets a deploy be checked for the two
+    // settings whose absence is silent but destructive: without persistent
+    // storage every restart drops all data, and without Apple revocation
+    // account deletion cannot revoke the Sign in with Apple grant.
+    persistentStorage: Boolean(process.env.DB_PATH)
   });
 });
 
